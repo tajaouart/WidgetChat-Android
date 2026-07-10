@@ -75,9 +75,22 @@ class ApiClient(
         }
     }
 
-    suspend fun history(userId: String): List<ChatMessage> = withContext(Dispatchers.IO) {
+    // Opt-in pagination: pass `limit` to fetch only the newest N messages, and
+    // `beforeId` to fetch the newest N older than that server id (the scroll-
+    // back cursor). With both null this returns the full history, so a backend
+    // that ignores the query params keeps working unchanged.
+    suspend fun history(
+        userId: String,
+        limit: Int? = null,
+        beforeId: Int? = null,
+    ): List<ChatMessage> = withContext(Dispatchers.IO) {
+        val params = buildList {
+            limit?.let { add("limit=$it") }
+            beforeId?.let { add("before_id=$it") }
+        }
+        val qs = if (params.isEmpty()) "" else "?" + params.joinToString("&")
         val req = Request.Builder()
-            .url("$baseUrl/api/chat/history/$userId/")
+            .url("$baseUrl/api/chat/history/$userId/$qs")
             .header("X-Project-Secret-Key", secretKey)
             .apply { userIdSignature?.let { header("X-User-Id-Signature", it) } }
             .build()

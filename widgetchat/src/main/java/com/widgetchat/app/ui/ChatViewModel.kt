@@ -1,6 +1,8 @@
 package com.widgetchat.app.ui
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.widgetchat.app.data.ChatMessage
 import com.widgetchat.app.data.MessageContent
@@ -29,6 +31,8 @@ data class ChatUiState(
     val config: RemoteConfig? = null,
     val messages: List<ChatMessage> = emptyList(),
     val isLoading: Boolean = true,
+    val isLoadingOlder: Boolean = false,   // scroll-back page in flight
+    val hasMore: Boolean = true,           // older history remains
     val isBotTyping: Boolean = false,
     val chatLocked: Boolean = false,
     val showDisclosure: Boolean = false,
@@ -37,10 +41,15 @@ data class ChatUiState(
     val error: String? = null,
 )
 
-class ChatViewModel(private val options: ChatOptions) : ViewModel() {
+class ChatViewModel(app: Application, private val options: ChatOptions) : AndroidViewModel(app) {
     private val api = ApiClient(options.baseUrl, options.secretKey)
     private val _state = MutableStateFlow(ChatUiState(locale = deviceLocale()))
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
+
+    // Persisted acknowledgement, scoped by secretKey so each app/project is
+    // remembered independently — matches iOS UserDefaults / Web localStorage / Flutter.
+    private val prefs = app.getSharedPreferences("widget_chat", Context.MODE_PRIVATE)
+    private val disclosureAckKey = "wc_disclosure_ack_${options.secretKey}"
 
     val isReadOnly get() = options.isReadOnly
 
@@ -58,7 +67,9 @@ class ChatViewModel(private val options: ChatOptions) : ViewModel() {
                 _state.value = _state.value.copy(config = cfg, locale = locale, themePref = theme)
                 loadHistory(cfg)
                 if (cfg.aiDisclosureEnabled) {
-                    _state.value = _state.value.copy(showDisclosure = true)
+                    // When ack is required, don't re-prompt once the user has dismissed it.
+                    val show = !cfg.aiDisclosureRequireAck || !prefs.getBoolean(disclosureAckKey, false)
+                    _state.value = _state.value.copy(showDisclosure = show)
                     api.consentEvent("disclosure_shown", options.userId, locale)
                 }
             } catch (e: Exception) {
@@ -69,21 +80,55 @@ class ChatViewModel(private val options: ChatOptions) : ViewModel() {
     }
 
     private suspend fun loadHistory(cfg: RemoteConfig) {
-        val history = runCatching { api.history(options.userId) }.getOrDefault(emptyList())
+        // Newest page only — older messages hydrate on scroll-up.
+        val history = runCatching {
+            api.history(options.userId, limit = HISTORY_PAGE_SIZE)
+        }.getOrDefault(emptyList())
+        val more = history.size >= HISTORY_PAGE_SIZE
         if (history.isEmpty()) {
             val welcome = cfg.welcomeMessage?.resolved(_state.value.locale)
-            if (!welcome.isNullOrEmpty()) {
-                _state.value = _state.value.copy(
-                    messages = listOf(ChatMessage(content = MessageContent.Markdown(welcome), isUser = false))
+            _state.value = if (!welcome.isNullOrEmpty()) {
+                _state.value.copy(
+                    messages = listOf(ChatMessage(content = MessageContent.Markdown(welcome), isUser = false)),
+                    hasMore = false,
                 )
+            } else {
+                _state.value.copy(hasMore = false)
             }
         } else {
-            _state.value = _state.value.copy(messages = history)
+            _state.value = _state.value.copy(messages = history, hasMore = more)
             pollPendingIfNeeded()
         }
     }
 
+    /// Loads the next older page and prepends it. Wired to the message list's
+    /// scroll-to-top trigger. No-ops when a page is already in flight or the
+    /// start of the thread has been reached. Dedups by server id.
+    fun loadOlderMessages() {
+        val s = _state.value
+        if (s.isLoadingOlder || !s.hasMore) return
+        val oldest = s.messages.mapNotNull { it.serverId }.minOrNull()
+        if (oldest == null) {
+            _state.value = s.copy(hasMore = false)
+            return
+        }
+        viewModelScope.launch {
+            _state.value = _state.value.copy(isLoadingOlder = true)
+            val older = runCatching {
+                api.history(options.userId, limit = HISTORY_PAGE_SIZE, beforeId = oldest)
+            }.getOrDefault(emptyList())
+            val seen = _state.value.messages.mapNotNull { it.serverId }.toSet()
+            val fresh = older.filter { it.serverId == null || it.serverId !in seen }
+            _state.value = _state.value.copy(
+                messages = fresh + _state.value.messages,
+                hasMore = older.size >= HISTORY_PAGE_SIZE,
+                isLoadingOlder = false,
+            )
+        }
+    }
+
     fun acknowledgeDisclosure() {
+        prefs.edit().putBoolean(disclosureAckKey, true).apply()
         _state.value = _state.value.copy(showDisclosure = false)
         viewModelScope.launch { api.consentEvent("consent_given", options.userId, _state.value.locale) }
     }
@@ -174,7 +219,10 @@ class ChatViewModel(private val options: ChatOptions) : ViewModel() {
             val welcome = cfg?.welcomeMessage?.resolved(_state.value.locale)
             val msgs = if (!welcome.isNullOrEmpty())
                 listOf(ChatMessage(content = MessageContent.Markdown(welcome), isUser = false)) else emptyList()
-            _state.value = _state.value.copy(messages = msgs, chatLocked = false)
+            // Nothing left to page back through after a wipe.
+            _state.value = _state.value.copy(
+                messages = msgs, chatLocked = false, hasMore = false, isLoadingOlder = false,
+            )
         }
     }
 
@@ -188,6 +236,11 @@ class ChatViewModel(private val options: ChatOptions) : ViewModel() {
     }
 
     fun clearError() { _state.value = _state.value.copy(error = null) }
+
+    private companion object {
+        // Messages fetched per history page. Kept at/under the backend clamp.
+        const val HISTORY_PAGE_SIZE = 25
+    }
 
     fun botName(): String = _state.value.config?.name?.resolved(_state.value.locale) ?: "Assistant"
 }

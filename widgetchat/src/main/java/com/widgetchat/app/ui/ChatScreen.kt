@@ -157,9 +157,36 @@ private fun MessageList(
     onOpenUrl: (String) -> Unit, onReport: (ChatMessage) -> Unit,
 ) {
     val listState = rememberLazyListState()
-    androidx.compose.runtime.LaunchedEffect(state.messages.size, state.isBotTyping) {
+    // Auto-scroll to the NEWEST message — keyed on its id, not the total count,
+    // so prepending an older page (which leaves the last id unchanged) never
+    // yanks the view to the bottom.
+    androidx.compose.runtime.LaunchedEffect(state.messages.lastOrNull()?.id, state.isBotTyping) {
         val count = state.messages.size + if (state.isBotTyping) 1 else 0
         if (count > 0) listState.animateScrollToItem(count - 1)
+    }
+    // Scroll-back: fetch the next older page as the visitor nears the top, and
+    // remember the current top message so we can re-anchor after the prepend.
+    var anchorKey by remember { mutableStateOf<String?>(null) }
+    var anchorOffset by remember { mutableStateOf(0) }
+    androidx.compose.runtime.LaunchedEffect(listState) {
+        androidx.compose.runtime.snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { idx ->
+                if (idx <= 1 && state.hasMore && !state.isLoadingOlder) {
+                    anchorKey = state.messages.getOrNull(idx)?.id
+                    anchorOffset = listState.firstVisibleItemScrollOffset
+                    vm.loadOlderMessages()
+                }
+            }
+    }
+    // After an older page lands (the first message id changes), pin the
+    // previously-top message back under the viewport so content doesn't jump.
+    androidx.compose.runtime.LaunchedEffect(state.messages.firstOrNull()?.id) {
+        val key = anchorKey ?: return@LaunchedEffect
+        val newIdx = state.messages.indexOfFirst { it.id == key }
+        if (newIdx > 0) {
+            listState.scrollToItem(newIdx, anchorOffset)
+            anchorKey = null
+        }
     }
     val density = androidx.compose.ui.platform.LocalDensity.current
     var bannerHeight by remember { mutableStateOf(0.dp) }
@@ -169,13 +196,22 @@ private fun MessageList(
             contentPadding = androidx.compose.foundation.layout.PaddingValues(
                 start = 12.dp, end = 12.dp, top = topPad, bottom = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(state.messages.size) { i ->
+            items(state.messages.size, key = { state.messages[it].id }) { i ->
                 val msg = state.messages[i]
                 MessageBubble(msg, colors, state, vm,
                     onAction = { vm.handleAction(it, onOpenUrl) },
                     onRate = { rating -> if (rating == "good") vm.rate(msg, "good") else onReport(msg) })
             }
             if (state.isBotTyping) item { TypingRow(colors) }
+        }
+        // Small spinner overlaid at the top while an older page loads. Kept as
+        // an overlay (not a list item) so list indices stay 1:1 with messages
+        // and the re-anchor math above stays simple.
+        if (state.isLoadingOlder) {
+            CircularProgressIndicator(
+                Modifier.align(Alignment.TopCenter).padding(top = topPad + 4.dp).size(20.dp),
+                strokeWidth = 2.dp,
+            )
         }
         // Disclaimer is a floating card pinned at the top; messages scroll
         // underneath it (hidden behind) rather than pushing it away. Its measured
